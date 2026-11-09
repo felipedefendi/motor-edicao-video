@@ -1,27 +1,27 @@
-﻿"""Detector de lip-sync quebrado nos clipes do avatar.
+"""Broken lip-sync detector for presenter clips.
 
-Para cada clipe: rastreia a cabeca por template (olhos+nariz) a 15fps, recorta a boca alinhada e mede o
-movimento entre frames. Fala ativa = dentro de uma palavra do Whisper. Fala com boca parada
-(< REL_THR da mediana) por > MIN_DUR = quebrado. Boca inicial de cada imagem: MOUTH no job_config.py.
+For each clip: tracks the head by template (eyes + nose) at 15 fps, crops the aligned mouth and measures
+the motion between frames. Active speech = inside a Whisper word. Speech with a still mouth
+(< REL_THR of the median) for longer than MIN_DUR = broken. Initial mouth position per clip: MOUTH in
+job_config.py.
 
-Saida: jobs/<job>/avatar/lipsync_clips.json  {clip: {"broken": [[ini, fim], ...], ...}} em tempo do clipe.
-Uso: python motor/lipsync.py jobs/<job>
+Output: jobs/<job>/avatar/lipsync_clips.json  {clip: {"broken": [[start, end], ...], ...}} in clip time.
+Usage: python assembly/lipsync.py jobs/<job>
 """
+import importlib.util
 import json
 import os
+import sys
 
 import cv2
 import numpy as np
 
-import importlib.util
-import sys
-
 JOB = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
 AV = os.path.join(JOB, "avatar")
-TR = os.path.join(AV, "transcricoes")
-VARIANT = os.environ.get("JOB_VARIANT", "").strip().lower()      # carro -> job_config_carro.py / lipsync_clips_carro.json
-SFX = "_" + VARIANT if VARIANT else ""
-_spec = importlib.util.spec_from_file_location("job_config", os.path.join(JOB, f"job_config{SFX}.py"))
+TR = os.path.join(AV, "transcripts")
+VARIANT = os.environ.get("JOB_VARIANT", "").strip().lower()      # <name> -> job_config_<name>.py / lipsync_clips_<name>.json
+SUFFIX = "_" + VARIANT if VARIANT else ""
+_spec = importlib.util.spec_from_file_location("job_config", os.path.join(JOB, f"job_config{SUFFIX}.py"))
 _cfg = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_cfg)
 CLIPS = ["hook_" + v.lower() for v in _cfg.VERSIONS] + list(_cfg.BODY)
@@ -32,20 +32,19 @@ CLIP_DIR = getattr(_cfg, "CLIP_DIR", {})
 def clip_file(c, ext):
     sub = CLIP_DIR.get(c)
     if ext == "json":
-        return os.path.join(AV, sub, "transcricoes", c + ".json") if sub else os.path.join(TR, c + ".json")
+        return os.path.join(AV, sub, "transcripts", c + ".json") if sub else os.path.join(TR, c + ".json")
     return os.path.join(AV, sub, c + ".mp4") if sub else os.path.join(AV, c + ".mp4")
+
+
 FPS = 15
 MIN_DUR = 0.40
-REL_THR = 0.38      # boca "parada" = movimento < 38% da mediana do movimento durante a fala
+REL_THR = 0.38      # "still" mouth = motion below 38% of the median motion during speech
 
 
 def words(clip):
     with open(clip_file(clip, "json"), encoding="utf-8") as f:
         j = json.load(f)
     return [(w["start"], w["end"]) for s in j["segments"] for w in s["words"]]
-
-
-
 
 
 def analyse(clip):
@@ -63,9 +62,9 @@ def analyse(clip):
             break
         if i % step == 0:
             g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            if tpl is None:   # template: olhos+nariz (sem a boca), para rastrear a cabeca
+            if tpl is None:   # template: eyes + nose (without the mouth), to track the head
                 tpl = g[my - 130: my - 25, mx - 80: mx + 80].copy()
-            else:             # busca a cabeca numa janela de +-50px
+            else:             # search for the head in a +-50px window
                 y0, x0 = max(0, my - 130 + dy - 50), max(0, mx - 80 + dx - 50)
                 win = g[y0: y0 + tpl.shape[0] + 100, x0: x0 + tpl.shape[1] + 100]
                 if win.shape[0] > tpl.shape[0] and win.shape[1] > tpl.shape[1]:
@@ -99,11 +98,12 @@ def analyse(clip):
     return {"broken": broken, "median": med, "t": t.tolist(), "motion": motion.tolist(),
             "speaking": speaking.tolist()}
 
+
 if __name__ == "__main__":
     out = {}
     for c in CLIPS:
         r = analyse(c)
         out[c] = r
-        print(f"{c:8s} quebrado: {r['broken'] if r else 'sem rosto'}")
-    with open(os.path.join(AV, f"lipsync_clips{SFX}.json"), "w", encoding="utf-8") as f:
+        print(f"{c:8s} broken: {r['broken'] if r else 'no face'}")
+    with open(os.path.join(AV, f"lipsync_clips{SUFFIX}.json"), "w", encoding="utf-8") as f:
         json.dump(out, f)

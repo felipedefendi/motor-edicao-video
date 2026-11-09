@@ -1,8 +1,8 @@
-﻿"""Tipografia cinetica palavra a palavra para as frases de impacto (v6).
+"""Word-by-word kinetic typography for emphasis phrases.
 
-Cada palavra e um evento ASS proprio, posicionado com medida real da fonte (Pillow, calibrado contra o libass),
-entrando no instante em que e falada: sobe 28px + escala 86%->100% + fade em ~180ms. Preenchimento solido,
-reto, halo escuro so por tras. Opcional: icone colorido (emoji Fluent do Windows) que entra com pop.
+Each word is its own ASS event, positioned with the real font measurement (Pillow, calibrated against
+libass) and entering at the instant it is spoken: rises 28px + scales 86%->100% + fades in ~180ms. Solid,
+upright fill with a dark halo behind it only. Optional: a colour icon (Windows Fluent emoji) that pops in.
 """
 import os
 import re
@@ -11,10 +11,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 FONT_FILE = r"C:\Windows\Fonts\bahnschrift.ttf"
 EMOJI_FILE = r"C:\Windows\Fonts\seguiemj.ttf"
-FONT_NAME, SCALEX = "Bahnschrift", 80
-CAL = 0.825            # libass desenha ~82.5% da largura medida pelo Pillow (calibrado)
-CAP_H = 0.61           # altura da maiuscula = 0.61 * fs
-LINE_H = 0.80          # entrelinha = 0.80 * fs (blocos condensados, como na referencia)
+FONT_NAME, SCALE_X = "Bahnschrift", 80
+CAL = 0.825            # libass draws ~82.5% of the width measured by Pillow (calibrated)
+CAP_H = 0.61           # cap height = 0.61 * font size
+LINE_H = 0.80          # line pitch = 0.80 * font size (condensed blocks)
 _fonts = {}
 
 
@@ -27,16 +27,16 @@ def _font(size):
 
 
 def width(text, fs):
-    return _font(100).getlength(text) * fs / 100 * SCALEX / 100 * CAL
+    return _font(100).getlength(text) * fs / 100 * SCALE_X / 100 * CAL
 
 
 def tokens_from_words(words):
-    """palavras faladas -> tokens de tela, literais e em CAIXA ALTA (so tira virgula/ponto finais)."""
+    """spoken words -> on-screen tokens, literal and in UPPER CASE (only trailing commas/periods removed)."""
     out = []
     for w in words:
         t = w["w"].strip()
         t = re.sub(r"[.,;:]+$", "", t)
-        if t.startswith("-") and out:            # "chemical -free" -> junta
+        if t.startswith("-") and out:            # "chemical -free" -> join
             out[-1] += t
             continue
         out.append(t.upper())
@@ -44,8 +44,8 @@ def tokens_from_words(words):
 
 
 def layout(tokens, max_w, fs_max, fs_min=60, max_lines=3, breaks=None, extra=None):
-    """quebra em linhas equilibradas e escolhe o maior fs que cabe. breaks = [n palavras por linha] opcional.
-    extra = {indice_token: largura_extra_em_fs} (ex.: icone)."""
+    """Breaks into balanced lines and picks the largest font size that fits. breaks = [words per line], optional.
+    extra = {token_index: extra width in font sizes} (e.g. an icon)."""
     extra = extra or {}
 
     def lines_for(fs):
@@ -56,7 +56,6 @@ def layout(tokens, max_w, fs_max, fs_min=60, max_lines=3, breaks=None, extra=Non
                 k += n
             return res
         best = None
-        n = len(tokens)
         for nl in range(1, max_lines + 1):
             target = sum(width(t, fs) for t in tokens) / nl
             res, cur, cw = [], [], 0
@@ -92,9 +91,9 @@ def ass_time(t):
 
 def phrase_events(tokens, times, end, cx, cy, max_w, fs_max, colors, base="&H00FFFFFF",
                   big=None, breaks=None, icon=None, max_lines=3):
-    """tokens + tempos (inicio de cada palavra) -> eventos ASS. colors = {indice: cor BGR}.
-    big = {indice: fator de escala} (ex.: "$5" 1.9x). icon = {"after": indice, "w": largura_em_fs}.
-    Retorna (eventos, posicao_do_icone|None)."""
+    """tokens + times (start of each word) -> ASS events. colors = {index: BGR colour}.
+    big = {index: scale factor} (e.g. a number at 1.9x). icon = {"after": index, "w": width in font sizes}.
+    Returns (events, icon_position | None)."""
     big = big or {}
     extra = {icon["after"]: icon["w"]} if icon else {}
     lines, fs = layout(tokens, max_w, fs_max, max_lines=max_lines, breaks=breaks, extra=extra)
@@ -116,11 +115,11 @@ def phrase_events(tokens, times, end, cx, cy, max_w, fs_max, colors, base="&H00F
                 icon_pos = (x + tw + 0.08 * fs, y_line, f_i)
             t0 = times[i] - 0.04
             col = colors.get(i, base)
-            fx = f"\\fn{FONT_NAME}\\b1\\fs{int(f_i)}\\fscx{int(SCALEX * 0.86)}\\fscy86"
+            fx = f"\\fn{FONT_NAME}\\b1\\fs{int(f_i)}\\fscx{int(SCALE_X * 0.86)}\\fscy86"
             mv = f"\\move({xc:.0f},{y_line + 28:.0f},{xc:.0f},{y_line:.0f},0,180)"
-            anim = f"\\t(0,180,\\fscx{SCALEX}\\fscy100)"
+            anim = f"\\t(0,180,\\fscx{SCALE_X}\\fscy100)"
             txt = tokens[i].replace("{", "").replace("}", "")
-            # halo escuro por tras (fill invisivel) — efeito so por fora
+            # dark halo behind (invisible fill) — the effect only shows outside the glyph
             ev.append(f"Dialogue: 5,{ass_time(t0)},{ass_time(end)},C,,0,0,0,,{{\\an5{mv}{fx}{anim}\\1a&HFF&"
                       f"\\3c&H000000&\\3a&H68&\\bord11\\blur12\\shad0\\fad(110,160)}}{txt}")
             ev.append(f"Dialogue: 6,{ass_time(t0)},{ass_time(end)},C,,0,0,0,,{{\\an5{mv}{fx}{anim}\\1c{col}"
@@ -130,7 +129,7 @@ def phrase_events(tokens, times, end, cx, cy, max_w, fs_max, colors, base="&H00F
 
 
 def render_icon(emoji, size_px, out_mov, fps=30, hold=6.0):
-    """emoji colorido -> .mov com alpha: pop 0->115%->100% em 8 frames, depois parado."""
+    """colour emoji -> .mov with alpha: pop 0->115%->100% over 8 frames, then still."""
     if os.path.exists(out_mov):
         return out_mov
     tmp = out_mov + "_frames"

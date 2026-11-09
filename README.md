@@ -1,43 +1,64 @@
-# Motor de Edição de Vídeo
+# Video Editing Engine
 
-Conjunto de scripts em Python que montam e auditam vídeos a partir da voz real,
-operados de ponta a ponta por agentes de IA (Claude Code, Codex e Custom GPT).
-Cada trabalho é descrito num arquivo de configuração próprio, e o mesmo motor
-serve a qualquer job.
+A set of Python scripts that assemble, repair and audit short and long videos from the real voice track,
+designed to be operated end to end by AI agents (Claude Code, Codex and Custom GPT skills). Every job is
+described by its own config file, so the same engine serves any project.
 
-## O que o motor faz
+## What it does
 
-- **Linha do tempo pela voz**: transcrição com Whisper (PyTorch/CUDA) com
-  timestamps por palavra; o nível de áudio corrige o atraso do Whisper ao
-  marcar palavras, e os cortes e aproximações nascem dessa linha do tempo.
-- **Legendas animadas** palavra a palavra em ASS, com medição real da fonte
-  (Pillow calibrado contra o libass) e ensaio de legendas antes do render.
-- **Montagem**: tela dividida, movimento de câmera em imagens paradas, mapa
-  de sobreposições de texto e B-roll, banco de efeitos sonoros cortados no
-  ataque do som, demos de estilo para comparação.
-- **Render** com FFmpeg usando filtros compostos e junção sem perdas em
-  paralelo.
-- **Visão computacional** com OpenCV: detector de boca fora de sincronia,
-  rastreamento de movimento (ORB/RANSAC), preenchimento de fundo, máscaras
-  por cor, sombra e composição para trocar um objeto dentro do vídeo.
-- **Auditoria do resultado** comparando quadros do original e do render por
-  histograma.
-- **Separação de voz e trilha** com Demucs e troca de falas com voz clonada
-  (ElevenLabs via REST API) e revisão fonética em contexto.
+- **Timeline from the voice**: Whisper transcription (PyTorch/CUDA) with word timestamps; the audio
+  envelope corrects the transcriber's late word boundaries, and cuts never land on a spoken word.
+- **Captions**: three styles (running caption with headline cards, condensed upper case with yellow
+  highlights, centred caption with full-screen emphasis), all rendered as ASS with real font measurement
+  (Pillow calibrated against libass).
+- **Assembly**: split-screen panels, b-roll with zoom and anchor control, scrims, animated emoji icons,
+  a sound-effect bank cut on the transient, FFmpeg rendering with complex filter graphs.
+- **Computer vision**: broken lip-sync detector, camera tracking (ORB + RANSAC) to composite a replacement
+  object, inpainting repair, HSV masks to carry on-screen text over to a new clip, histogram-based render audit.
+- **Audio**: voice/bed separation with Demucs, speech replacement with RMS matching and bounded time-stretch.
+- **Reference study**: frame extraction, scene cuts, dominant colours, dossiers and presenter catalogues
+  from reference videos.
 
-## Estrutura
+## Layout
 
-| Pasta | Conteúdo |
+| Folder | Scripts |
 |---|---|
-| `ADVALIDADO-MEMO/` | Montagem completa: transcrição, legendas cinéticas, lip-sync, B-roll, SFX, demos de estilo e análise de variações. |
-| `TROCA-POTE-VSL/` | Edição de vídeos longos: cortes, substituição de objeto em cena, restauração de letreiros, troca de falas e auditoria do render. |
+| `assembly/` | `assemble.py` (main engine), `kinetic.py` (word-by-word typography), `lipsync.py`, `sfx_bank.py`, `caption_preview.py`, `overlay_map.py`, `demos/` (style sheets, style combos, SFX audition) |
+| `longform/` | `scan_frames.py`, `scene_cuts.py`, `cutout_object.py`, `composite_object.py`, `restore_text.py`, `replace_speech.py`, `replace_windows.py`, `assemble_lossless.py`, `scan_onscreen_text.py`, `audit_render.py` |
+| `analysis/` | `transcribe.py`, `extract_frames.py`, `build_dossier.py`, `find_shared_copy.py`, `extract_presenters.py`, `download_contact_sheet.ps1` |
 
-## Requisitos
+## Job layout (assembly)
 
-- Python 3.12+
-- FFmpeg e ffprobe no PATH
-- `openai-whisper`, `torch` (CUDA opcional), `opencv-python`, `pillow`,
-  `numpy`, `demucs`
+```
+jobs/<job>/
+  job_config.py          clips, b-roll per phrase, highlights, emphasis, lip-sync coverage
+  avatar/<clip>.mp4      presenter takes
+  avatar/transcripts/    Whisper JSON per clip
+  work/<style>/          captions, filter graphs, plans and test renders
+  output/                final renders and the lip-sync report
+library/
+  broll/  sfx/bank/  assets/  fonts/
+```
 
-Os scripts leem a configuração de cada job em arquivo próprio e gravam
-relatórios de auditoria ao lado do render.
+## Job layout (long form)
+
+```
+jobs/<job>/
+  input/original.mp4
+  docs/windows.json      replaced windows: start, end, clip, fade
+  docs/composite.json    object composite recipe per window
+  docs/texts.json        on-screen text restoration per window
+  docs/speech_swaps.json speech replacement recipe
+  work/                  scans, cuts, clips, previews, suspects
+  output/                renders (+ _history)
+```
+
+## Requirements
+
+- Python 3.12+, FFmpeg and ffprobe on the PATH
+- `pip install -r requirements.txt` (`openai-whisper`, `torch`, `opencv-python`, `pillow`, `numpy`,
+  `demucs`, `soundfile`, `easyocr`)
+- Fonts referenced by the caption styles in `library/fonts/`
+
+Every render is followed by an audit: the engine reduces the video to a short list of frames and numbers
+for a person to check before delivery.

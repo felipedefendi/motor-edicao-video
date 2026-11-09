@@ -1,10 +1,16 @@
-"""Motor de montagem ADVALIDADO-MEMO (padrao v5: impacto estilo @migs.visuals + SFX enxuto).
+"""Assembly engine: cuts presenter clips by the real voice, lays b-roll, captions, emphasis typography and
+sound effects, and renders with FFmpeg.
 
-Uso:   python motor/montar.py jobs/<job> [A B C]
-Teste: V7_TEST=10 python motor/montar.py jobs/<job> A      (render de 10s em jobs/<job>/work/v7/)
+Usage:  python assembly/assemble.py jobs/<job> [A B C]
+Test:   TEST_SECONDS=10 python assembly/assemble.py jobs/<job> A      (10-second render in jobs/<job>/work/<style>/)
 
-Le jobs/<job>/job_config.py (b-roll por frase, enfases, cobertura de lip-sync) e usa a biblioteca
-compartilhada (biblioteca/broll, biblioteca/sfx/bank, biblioteca/assets). Detalhes do padrao: SKILL.md.
+Reads jobs/<job>/job_config.py (b-roll per phrase, emphasis, lip-sync coverage) and the shared library
+(library/broll, library/sfx/bank, library/assets, library/fonts).
+
+Caption styles, chosen by the job config:
+  classic    - running caption at the bottom + headline cards (CALLOUTS) and kinetic phrases (KINETIC_PHRASES)
+  condensed  - every spoken word in condensed upper case, highlighted phrases in yellow (HIGHLIGHT + SFX_CONDENSED)
+  centered   - one caption at a time in the centre, small highlights and full-screen emphasis (EMPHASIS)
 """
 import json
 import os
@@ -19,30 +25,30 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kinetic  # noqa: E402
 
-SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))     # .../ADVALIDADO-MEMO
-LIB = os.path.join(SKILL, "biblioteca")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LIB = os.path.join(ROOT, "library")
 BR = os.path.join(LIB, "broll")
 BANK = os.path.join(LIB, "sfx", "bank")
 ASSETS = os.path.join(LIB, "assets")
 
 
 def load_job(job_dir):
-    """Carrega jobs/<job>/job_config.py e injeta as constantes MAIUSCULAS neste modulo."""
+    """Loads jobs/<job>/job_config.py and injects its UPPERCASE constants into this module."""
     import importlib.util
-    global JOB, AV, TR, OUT, WORK, V3PLAN
+    global JOB, AV, TR, OUT, WORK, PREVIOUS_PLAN
     JOB = os.path.abspath(job_dir)
-    AV, OUT = os.path.join(JOB, "avatar"), os.path.join(JOB, "entrega")
-    TR = os.path.join(AV, "transcricoes")
-    WORK, V3PLAN = os.path.join(JOB, "work", "v7"), os.path.join(JOB, "work", "v5")
-    # JOB_VARIANT=carro -> job_config_carro.py, work/v8_carro, lipsync_clips_carro.json, entrega com _CARRO (nao toca a principal)
-    sfx = "_" + VARIANT if VARIANT else ""
-    spec = importlib.util.spec_from_file_location("job_config", os.path.join(JOB, f"job_config{sfx}.py"))
+    AV, OUT = os.path.join(JOB, "avatar"), os.path.join(JOB, "output")
+    TR = os.path.join(AV, "transcripts")
+    WORK, PREVIOUS_PLAN = os.path.join(JOB, "work", "condensed"), os.path.join(JOB, "work", "previous")
+    # JOB_VARIANT=<name> -> job_config_<name>.py, work/centered_<name>, lipsync_clips_<name>.json, output with _<NAME>
+    suffix = "_" + VARIANT if VARIANT else ""
+    spec = importlib.util.spec_from_file_location("job_config", os.path.join(JOB, f"job_config{suffix}.py"))
     cfg = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cfg)
     globals().update({k: v for k, v in vars(cfg).items() if k.isupper()})
-    if is_v8():
-        WORK = os.path.join(JOB, "work", "v8" + sfx)
-        globals()["BROLL"] = {**BROLL, **globals().get("BROLL8", {})}
+    if is_centered():
+        WORK = os.path.join(JOB, "work", "centered" + suffix)
+        globals()["BROLL"] = {**BROLL, **globals().get("BROLL_CENTERED", {})}
     os.makedirs(WORK, exist_ok=True)
 
 
@@ -50,10 +56,10 @@ VARIANT = os.environ.get("JOB_VARIANT", "").strip().lower()
 
 
 def clip_file(c, ext):
-    """mp4 / transcricao do clipe; CLIP_DIR (job_config) = {clip: subpasta de avatar/} para takes de outra variacao."""
+    """mp4 / transcript of a clip; CLIP_DIR (job_config) = {clip: subfolder of avatar/} for takes of another variant."""
     sub = globals().get("CLIP_DIR", {}).get(c)
     if ext == "json":
-        return os.path.join(AV, sub, "transcricoes", c + ".json") if sub else os.path.join(TR, c + ".json")
+        return os.path.join(AV, sub, "transcripts", c + ".json") if sub else os.path.join(TR, c + ".json")
     return os.path.join(AV, sub, c + ".mp4") if sub else os.path.join(AV, c + ".mp4")
 
 
@@ -61,53 +67,53 @@ def lipsync_file():
     return os.path.join(AV, f"lipsync_clips{'_' + VARIANT if VARIANT else ''}.json")
 
 
-def is_v8():
-    """padrao v8 quando o job tem IMPACT8 (MOTOR_V=7 forca a v7)."""
-    return bool(globals().get("IMPACT8")) and os.environ.get("MOTOR_V") != "7"
+def is_centered():
+    """centered style when the job defines EMPHASIS (ENGINE_STYLE=condensed forces the condensed style)."""
+    return bool(globals().get("EMPHASIS")) and os.environ.get("ENGINE_STYLE") != "condensed"
 
 
 W, H, PH, FPS, SR = 720, 1280, 640, 30, 48000
-FIX = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+COLOR = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
 GAP_MAX, GAP_PAD, TAIL = 0.50, 0.15, 0.30
-END_HOLD = 0.6                                         # folga no fim do video (ultimo quadro parado + silencio)
+END_HOLD = 0.6                                         # slack at the end of the video (last frame held + silence)
 PUNCH, SPLIT_ZOOM = 1.08, 1.12
 COVER_PAD = 0.15
 MAX_FACELESS = 7.0
 
-COLORS = {"Y": "&H0000D4FF", "R": "&H003A4BFF", "W": "&H00FFFFFF", "G": "&H006BE82E"}  # BGR, solidos
-CAP_FONT, CAP_SIZE = "Segoe UI Semibold", 54          # legenda corrida (limpa, estilo referencia)
-HEAD_FONT, HEAD_SCALEX = "Bahnschrift", 80            # condensada (Bahnschrift Bold comprimida ~ Bebas Neue)
-LEAD_FONT = "Georgia"                                 # linha pequena em italico acima da manchete
-Y_CAP, YS_CAP = 1075, 640                             # legenda corrida: normal / split
-Y_HEAD, YS_HEAD = 1035, 640                           # manchete: normal / split
+COLORS = {"Y": "&H0000D4FF", "R": "&H003A4BFF", "W": "&H00FFFFFF", "G": "&H006BE82E"}  # BGR, solid
+CAP_FONT, CAP_SIZE = "Segoe UI Semibold", 54          # running caption (clean)
+HEAD_FONT, HEAD_SCALEX = "Bahnschrift", 80            # condensed (Bahnschrift Bold compressed)
+LEAD_FONT = "Georgia"                                 # small italic line above the headline
+Y_CAP, YS_CAP = 1075, 640                             # running caption: normal / split
+Y_HEAD, YS_HEAD = 1035, 640                           # headline: normal / split
 CHUNK_MAX, CHUNK_CHARS = 4, 22
-LETTER_MS = 32                                        # intervalo do "digitado" letra a letra
-# SFX enxuto e coerente: poucos eventos, mesmos arquivos repetidos de proposito
+LETTER_MS = 32                                        # interval of the letter-by-letter "typing"
+# lean SFX: few events, the same files repeated on purpose
 SFX_FILES = {"whoosh": "whoosh_s/whoosh_s_01_1492.wav", "swoosh": "whoosh_l/whoosh_l_01_1489.wav",
              "impact": "impact/impact_01_1143.wav", "pop": "pop/pop_03_3005.wav",
              "riser": "riser/riser_01_790.wav", "ding": "ding/ding_01_3109.wav",
              "heart": "impact/impact_05_498.wav", "money": "money/money_01_1999.wav",
              "air": "whoosh_l/whoosh_l_01_1489.wav"}
-COLORS6 = {"G": "&H006BE82E", "R": "&H003B3BFF", "Y": "&H0000D4FF", "W": "&H00FFFFFF"}   # BGR solidos
-# v7: legenda condensada (referencia Dreamina) em toda a fala; destaque amarelo puro e maior
-CAP7_FONT, CAP7_FILE, CAP7_FS = "League Gothic", "LeagueGothic.ttf", 118
-CAP7_CHARW = 0.26                                     # largura media da maiuscula em League Gothic / fs
-HL7_COLOR, HL7_SCALE = "&H0000E6FF&", 1.45            # #FFE600
-CHUNK7_WORDS, CHUNK7_CHARS = 3, 18
-SFX_FILES.update({"looming": "v7/looming.wav", "flash": "v7/flash.wav", "clock": "v7/clock.wav",
-                  "cymbal": "v7/cymbal.wav"})
-# v8 (demos v8 / D4 aprovada 15/10/2026): legenda Montserrat centralizada, uma por vez; destaque pequeno amarelo/lockup;
-# impacto de tela cheia (blur + escurece, palavra a palavra, cor por sentido) so nos IMPACT8 do job
-CAP8_FAM, CAP8_FILE, CAP8_FS = "Montserrat Thin", "Montserrat-Bold.ttf", 54   # familia interna do Bold do Fontsource (+ \b1)
-LG8_FAM, LG8_FILE = "League Gothic", "LeagueGothic.ttf"
-RATIO8 = {CAP8_FILE: 0.6346, LG8_FILE: 0.7663}       # largura libass / Pillow (calibrado em canvas 720x1280)
-COR8 = {"Y": "FFE600", "G": "00E35B", "R": "FF2B2B", "W": "FFFFFF"}   # amarelo numero/prova, verde transformacao, vermelho dor
-Y8 = 640                                             # centro do quadro (no split = costura)
-UNITS8 = {"hours", "seconds", "years", "weeks", "days", "minutes", "million", "views"}
-FW8 = {"a", "an", "the", "to", "and", "than", "less", "of", "in", "on", "at", "for", "with", "from", "that", "my", "her",
-       "your", "his", "their", "it", "is", "i", "you", "she", "we", "but", "or", "so", "because", "will", "just", "when",
-       "more", "this", "these", "are", "was", "had", "have", "has", "who", "what", "me"}
-SFX_FILES.update({k: f"v8/{k}.wav" for k in ("pop02", "click05", "whoosh01", "whoosh04", "swipe01", "swipe02")})
+COLORS_KINETIC = {"G": "&H006BE82E", "R": "&H003B3BFF", "Y": "&H0000D4FF", "W": "&H00FFFFFF"}   # BGR solid
+# condensed style: condensed caption over all speech; pure yellow, larger highlight
+CAPC_FONT, CAPC_FILE, CAPC_FS = "League Gothic", "LeagueGothic.ttf", 118
+CAPC_CHARW = 0.26                                     # average upper-case width in League Gothic / font size
+HLC_COLOR, HLC_SCALE = "&H0000E6FF&", 1.45            # #FFE600
+CHUNKC_WORDS, CHUNKC_CHARS = 3, 18
+SFX_FILES.update({"looming": "condensed/looming.wav", "flash": "condensed/flash.wav",
+                  "clock": "condensed/clock.wav", "cymbal": "condensed/cymbal.wav"})
+# centered style: Montserrat caption centred, one at a time; small yellow highlight / lockup;
+# full-screen emphasis (blur + darken, word by word, colour by meaning) only on the job's EMPHASIS entries
+CAPM_FAM, CAPM_FILE, CAPM_FS = "Montserrat Thin", "Montserrat-Bold.ttf", 54   # internal family name of the Fontsource Bold (+ \b1)
+LG_FAM, LG_FILE = "League Gothic", "LeagueGothic.ttf"
+RATIO = {CAPM_FILE: 0.6346, LG_FILE: 0.7663}         # libass / Pillow width (calibrated on a 720x1280 canvas)
+PALETTE = {"Y": "FFE600", "G": "00E35B", "R": "FF2B2B", "W": "FFFFFF"}   # yellow numbers, green positive, red negative
+Y_CENTER = 640                                       # centre of the frame (on split = the seam)
+UNITS = {"hours", "seconds", "years", "weeks", "days", "minutes", "million", "views"}
+FUNCTION_WORDS = {"a", "an", "the", "to", "and", "than", "less", "of", "in", "on", "at", "for", "with", "from", "that",
+                  "my", "her", "your", "his", "their", "it", "is", "i", "you", "she", "we", "but", "or", "so", "because",
+                  "will", "just", "when", "more", "this", "these", "are", "was", "had", "have", "has", "who", "what", "me"}
+SFX_FILES.update({k: f"centered/{k}.wav" for k in ("pop02", "click05", "whoosh01", "whoosh04", "swipe01", "swipe02")})
 
 
 def norm(s):
@@ -128,10 +134,10 @@ def load_words(name):
     with open(clip_file(name, "json"), encoding="utf-8") as f:
         j = json.load(f)
     out = []
-    fix = {k.lower(): v for k, v in globals().get("WORD_FIX", {}).items()}   # job_config: {"vix": "Vicks"} (Whisper -> copy)
+    fix = {k.lower(): v for k, v in globals().get("WORD_FIX", {}).items()}   # job_config: {"heard": "Written"} (transcriber -> script)
     for w in (w for seg in j["segments"] for w in seg["words"]):
         t = w["word"].strip()
-        t = globals().get("TOKEN_FIX", {}).get((name, t), t)   # job_config: {(clip, "names,"): "names"} pontuacao fora da copy
+        t = globals().get("TOKEN_FIX", {}).get((name, t), t)   # job_config: {(clip, "names,"): "names"} punctuation not in the script
         if out and re.fullmatch(r"[,%.]\d*%?", t) and out[-1]["w"][-1:].isdigit():   # "86" ",000" -> "86,000" | "97" "%" -> "97%"
             out[-1]["w"] += t
             out[-1]["e"] = float(w["end"])
@@ -139,7 +145,7 @@ def load_words(name):
         m_ = re.fullmatch(r"([^A-Za-z0-9']*)([A-Za-z0-9']+)([^A-Za-z0-9']*)", t)
         if m_ and m_.group(2).lower() in fix:
             t = m_.group(1) + fix[m_.group(2).lower()] + m_.group(3)
-        # WORD_JOIN (job_config): {"vapor rub": "VapoRub"} — Whisper partiu uma palavra da copy em duas
+        # WORD_JOIN (job_config): {"two words": "OneWord"} — the transcriber split one word of the script in two
         pair = (norm(out[-1]["w"]) + " " + norm(t)) if out else ""
         if pair in globals().get("WORD_JOIN", {}):
             out[-1]["w"] = re.sub(r"[A-Za-z0-9']+", "", out[-1]["w"]) + WORD_JOIN[pair] + re.sub(r"^[^.,!?;:]*", "", t)
@@ -159,8 +165,8 @@ _env = {}
 
 
 def voice_env(path):
-    """nivel da voz (dB RMS em janelas de 10 ms) — o Whisper as vezes marca o inicio da palavra atrasado
-    (hook_b: "Doctors" falado em 7.15s, marcado 7.40s) e o corte de pausa comia o comeco da palavra."""
+    """voice level (dB RMS in 10 ms windows) — the transcriber sometimes marks the start of a word late,
+    and a pause cut would eat the beginning of the word."""
     if path not in _env:
         r = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
                            capture_output=True, check=True)
@@ -172,8 +178,8 @@ def voice_env(path):
 
 
 def voice_edge(path, t, direction, limit=0.6, thr=-50.0):
-    """anda de t enquanto ha voz (> thr dB) ate 'limit' s, atravessando micro-pausas < 80 ms (oclusiva do "D");
-    devolve a borda real da fala."""
+    """walks from t while there is voice (> thr dB) up to 'limit' s, crossing micro-pauses < 80 ms (plosives);
+    returns the real edge of the speech."""
     env = voice_env(path)
     i = int(t * 100)
     last, quiet = i, 0
@@ -191,7 +197,7 @@ def voice_edge(path, t, direction, limit=0.6, thr=-50.0):
 
 
 def build_timeline(clips):
-    """Cortes seguem a voz real (Felipe, v8: "cortando a ultima palavra ou a primeira", "live" cortado no fim)."""
+    """Cuts follow the real voice: never the last word of a clip or the first of the next."""
     timeline, words, t = [], [], 0.0
     for ci, c in enumerate(clips):
         path = clip_file(c, "mp4")
@@ -201,7 +207,7 @@ def build_timeline(clips):
             if b["s"] - a["e"] > GAP_MAX:
                 end_a = max(a["e"], voice_edge(path, a["e"], +1)) + GAP_PAD
                 start_b = min(b["s"], voice_edge(path, b["s"], -1)) - GAP_PAD
-                if start_b - end_a < 0.05:              # a voz ocupa a pausa: nao corta
+                if start_b - end_a < 0.05:              # the voice fills the pause: do not cut
                     continue
                 segs.append((start, end_a))
                 start = start_b
@@ -209,7 +215,7 @@ def build_timeline(clips):
         end = dur if last_clip else min(dur, max(ws[-1]["e"], voice_edge(path, ws[-1]["e"], +1)) + TAIL)
         segs.append((start, end))
         for k, (s0, s1) in enumerate(segs):
-            hold = END_HOLD if last_clip and k == len(segs) - 1 else 0.0   # folga no fim do video (quadro parado)
+            hold = END_HOLD if last_clip and k == len(segs) - 1 else 0.0   # slack at the end of the video (held frame)
             timeline.append({"clip": c, "path": path, "src": s0, "len": s1 - s0, "start": t, "hold": hold})
             for w in ws:
                 if s0 <= w["s"] < s1:
@@ -219,7 +225,7 @@ def build_timeline(clips):
 
 
 def clip_to_timeline(timeline, clip, a, b):
-    """Intervalo [a,b] em tempo do clipe -> lista de intervalos na timeline (respeita os cortes de pausa)."""
+    """Interval [a,b] in clip time -> list of intervals on the timeline (respecting the pause cuts)."""
     out = []
     for seg in timeline:
         if seg["clip"] != clip:
@@ -238,7 +244,7 @@ def find_phrase(words, clip, phrase):
         idx = cw[k:k + len(toks)]
         if [norm(words[i]["w"]) for i in idx] == toks:
             return idx
-    raise ValueError(f"frase '{phrase}' nao encontrada em {clip}")
+    raise ValueError(f"phrase '{phrase}' not found in {clip}")
 
 
 def phrase_window(words, clip, phrase, total):
@@ -253,7 +259,7 @@ def phrase_window(words, clip, phrase, total):
 
 
 def coverage(intervals, overlays):
-    """fracao de cada intervalo coberta por overlays full-screen."""
+    """fraction of each interval covered by full-screen overlays."""
     res = []
     for a, b in intervals:
         cov = 0.0
@@ -276,7 +282,7 @@ class SfxBank:
             self.files[cat], self.pos[cat] = fs, 0
         self.cache = {}
 
-    def next(self, cat):                       # round-robin: nunca repete o mesmo arquivo em seguida
+    def next(self, cat):                       # round-robin: never repeats the same file back to back
         fs = self.files[cat]
         f = fs[self.pos[cat] % len(fs)]
         self.pos[cat] += 1
@@ -308,7 +314,7 @@ def build_sfx_track(bank, events, total, path):
     return used
 
 
-# ---------------- legenda solida ----------------
+# ---------------- classic captions ----------------
 
 def ass_time(t):
     t = max(0.0, t)
@@ -319,8 +325,8 @@ def esc(s):
     return s.replace("{", "").replace("}", "")
 
 
-def write_ass(path, words, total, split_windows, impacts, extra_events=(), extra_cov=()):
-    """Legenda v5. impacts: [(a, b, idx, lead, BIG, kind, cor)] kind = head | card."""
+def write_ass_classic(path, words, total, split_windows, callouts, extra_events=(), extra_cov=()):
+    """Classic captions. callouts: [(a, b, idx, lead, BIG, kind, colour)] kind = head | card."""
     head = [
         "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {W}", f"PlayResY: {H}", "WrapStyle: 2", "",
         "[V4+ Styles]",
@@ -336,7 +342,7 @@ def write_ass(path, words, total, split_windows, impacts, extra_events=(), extra
     T = ass_time
 
     def typed(text, color, t0=0):
-        """texto 'digitado' letra a letra: cada letra entra de cinza translucido para a cor solida."""
+        """'typed' text letter by letter: each letter goes from translucent grey to the solid colour."""
         out, k = [], 0
         for ch in text:
             if ch == "\n":
@@ -352,19 +358,19 @@ def write_ass(path, words, total, split_windows, impacts, extra_events=(), extra
         return "".join(out), t0 + k * LETTER_MS + 140
 
     covered = list(extra_cov)
-    for k, (a, b, idx, lead, big, kind, color) in enumerate(impacts):
+    for k, (a, b, idx, lead, big, kind, color) in enumerate(callouts):
         b = max(b, a + 1.0)
         covered.append((a, b))
         col = COLORS.get(color, COLORS["W"])
         lines = big.split("\n")
         longest = max(len(x) for x in lines)
         if kind == "card":
-            size = int(min(250, 640 / (0.38 * max(4, longest))))      # ocupa ~90% da largura (como a referencia)
+            size = int(min(250, 640 / (0.38 * max(4, longest))))      # fills ~90% of the width
             txt, _ = typed(big, col)
             fx = f"\\fn{HEAD_FONT}\\b1\\fs{size}\\fscx{HEAD_SCALEX}\\bord0\\shad0"
             ev.append(f"Dialogue: 4,{T(a)},{T(b)},C,,0,0,0,,{{\\pos({W // 2},{H // 2}){fx}\\fad(0,60)}}{txt}")
             continue
-        # manchete sobre o video: lead em italico pequeno + palavra(s) condensadas grandes, retas
+        # headline over the video: small italic lead + big condensed upright word(s)
         sp = in_split(a)
         y = YS_HEAD if sp else Y_HEAD
         size = int(min(150, 560 / (0.38 * max(4, longest))))
@@ -378,13 +384,13 @@ def write_ass(path, words, total, split_windows, impacts, extra_events=(), extra
                       f"\\shad2\\4a&H40&\\fad(160,120)}}{esc(lead)}")
             t_big = 120
         txt, _ = typed(big, col, t_big)
-        # halo escuro so por tras (fill invisivel), entra junto e sai junto
+        # dark halo behind only (invisible fill), enters and leaves together with the text
         ev.append(f"Dialogue: 2,{T(a)},{T(b)},C,,0,0,0,,{{\\pos({W // 2},{y}){fx}\\1a&HFF&\\3c&H000000&\\3a&H90&"
                   f"\\bord12\\blur14\\shad0\\fad(220,120)}}{esc(big).replace(chr(10), '\\N')}")
         ev.append(f"Dialogue: 3,{T(a)},{T(b)},C,,0,0,0,,{{\\pos({W // 2},{y}){fx}\\bord0\\shad3\\4a&H60&"
                   f"\\fad(0,120)}}{txt}")
 
-    # legenda corrida: palavras aparecem conforme sao faladas; so palavra-chave colorida
+    # running caption: words appear as they are spoken; only keywords in colour
     in_cov = lambda t: any(a <= t < b for a, b in covered)
     cap = [w for w in words if not in_cov(w["s"])]
     chunks, cur = [], []
@@ -415,16 +421,16 @@ def write_ass(path, words, total, split_windows, impacts, extra_events=(), extra
         f.write("\n".join(head + ev) + "\n")
 
 
-def write_ass_v7(path, words, total, split_windows, hl):
-    """Legenda v7: toda palavra falada aparece (CAIXA ALTA, condensada, reta, palavra a palavra).
-    hl = indices de palavras destacadas -> bloco proprio, amarelo, maior, com pop curto."""
+def write_ass_condensed(path, words, total, split_windows, hl):
+    """Condensed captions: every spoken word appears (UPPER CASE, condensed, upright, word by word).
+    hl = indices of highlighted words -> their own block, yellow, larger, with a short pop."""
     head = [
         "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {W}", f"PlayResY: {H}", "WrapStyle: 2", "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: C,{CAP7_FONT},{CAP7_FS},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
+        f"Style: C,{CAPC_FONT},{CAPC_FS},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
         "0,0,0,0,100,100,0,0,1,0,0,5,30,30,0,1",
         "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
@@ -436,7 +442,7 @@ def write_ass_v7(path, words, total, split_windows, hl):
         nxt = i + 1 if i + 1 < len(words) else None
         txt = " ".join(words[k]["w"] for k in cur)
         if (nxt is None or (i in hl) != (nxt in hl) or words[nxt]["clip"] != w["clip"]
-                or (i not in hl and (len(cur) >= CHUNK7_WORDS or len(txt) + 1 + len(words[nxt]["w"]) > CHUNK7_CHARS
+                or (i not in hl and (len(cur) >= CHUNKC_WORDS or len(txt) + 1 + len(words[nxt]["w"]) > CHUNKC_CHARS
                                      or re.search(r"[.,!?]$", w["w"])))
                 or words[nxt]["s"] - w["e"] > 0.35 or in_split(words[nxt]["s"]) != in_split(words[cur[0]]["s"])):
             chunks.append(cur)
@@ -450,14 +456,14 @@ def write_ass_v7(path, words, total, split_windows, hl):
         y = YS_CAP if in_split(s0) else Y_CAP - 15
         toks = [re.sub(r"[.,;:]+$", "", words[k]["w"]).upper() for k in ch]
         lines = [list(range(len(toks)))]
-        fs = CAP7_FS
+        fs = CAPC_FS
         if is_hl:
             chars = len(" ".join(toks))
-            if chars > 14 and len(toks) > 1:            # quebra em 2 linhas equilibradas
+            if chars > 14 and len(toks) > 1:            # break into 2 balanced lines
                 best = min(range(1, len(toks)), key=lambda c: abs(len(" ".join(toks[:c])) - len(" ".join(toks[c:]))))
                 lines = [list(range(best)), list(range(best, len(toks)))]
             longest = max(len(" ".join(toks[k] for k in l)) for l in lines)
-            fs = int(min(CAP7_FS * HL7_SCALE, 640 / (CAP7_CHARW * longest)))
+            fs = int(min(CAPC_FS * HLC_SCALE, 640 / (CAPC_CHARW * longest)))
         fill, halo = [], []
         for li, line in enumerate(lines):
             for j, k in enumerate(line):
@@ -466,7 +472,7 @@ def write_ass_v7(path, words, total, split_windows, hl):
                 sep = " " if j < len(line) - 1 else ("\\N" if li < len(lines) - 1 else "")
                 fill.append(f"{{\\alpha&HFF&\\t({t},{t + 90},\\alpha&H00&)}}{tok}{sep}")
                 halo.append(f"{{\\3a&HFF&\\t({t},{t + 90},\\3a&H70&)}}{tok}{sep}")
-        col = HL7_COLOR if is_hl else "&H00FFFFFF&"
+        col = HLC_COLOR if is_hl else "&H00FFFFFF&"
         pop = "\\fscx110\\fscy110\\t(0,120,\\fscx100\\fscy100)" if is_hl else ""
         base = f"\\an5\\pos({W // 2},{y})\\fs{fs}{pop}\\fad(0,80)"
         ev.append(f"Dialogue: 1,{T(s0)},{T(end)},C,,0,0,0,,{{{base}\\1a&HFF&\\bord14\\blur16\\3c&H000000&}}"
@@ -476,51 +482,53 @@ def write_ass_v7(path, words, total, split_windows, hl):
         f.write("\n".join(head + ev) + "\n")
 
 
-# ---------------- legenda v8 ----------------
-_font8 = {}
+# ---------------- centered captions ----------------
+_fonts = {}
 
 
-def tw8(file, text, fs):
-    """largura do texto no libass (Pillow calibrado)."""
+def text_width(file, text, fs):
+    """width of the text in libass (calibrated Pillow)."""
     from PIL import ImageFont
-    if file not in _font8:
-        _font8[file] = ImageFont.truetype(os.path.join(LIB, "fontes", file), 100)
-    return _font8[file].getlength(text) * fs / 100 * RATIO8[file]
+    if file not in _fonts:
+        _fonts[file] = ImageFont.truetype(os.path.join(LIB, "fonts", file), 100)
+    return _fonts[file].getlength(text) * fs / 100 * RATIO[file]
 
 
-def bgr8(hexrgb):
+def bgr(hexrgb):
     return f"&H00{hexrgb[4:6]}{hexrgb[2:4]}{hexrgb[0:2]}&".upper()
 
 
-def write_ass_v8(path, words, total, split_windows, imps, hls):
-    """Legenda v8 (SKILL.md "Padrao v8 aprovado"). imps = [(indices, cfg IMPACT8)], hls = [(indices, estilo)].
-    Uma legenda por vez no centro; destaque pequeno = comeco da frase na legenda comum + parte forte grande embaixo;
-    impacto = tela cheia palavra a palavra. Retorna (janelas de blur, sons [(t, cat, ganho, prioridade)])."""
+def write_ass_centered(path, words, total, split_windows, emphases, highlights):
+    """Centered captions. emphases = [(indices, EMPHASIS cfg)], highlights = [(indices, style)].
+    One caption at a time in the centre; small highlight = start of the sentence in the regular caption +
+    strong part big below; emphasis = full screen word by word. Returns (blur windows, sounds
+    [(t, cat, gain, priority)])."""
     T = ass_time
-    fs = CAP8_FS
+    fs = CAPM_FS
     halo = "\\1a&HFF&\\bord8\\blur10\\3c&H000000&\\3a&H80&\\shad0"
-    in_split = lambda t: any(a - 1e-3 <= t < b - 1e-3 for a, b in split_windows)    # tolerancia: fim do hook = 7.69 vs 7.6899
+    in_split = lambda t: any(a - 1e-3 <= t < b - 1e-3 for a, b in split_windows)    # tolerance for float edges
     used, units = set(), []
-    for idx, cfg in imps:
-        units.append({"kind": "imp", "idx": idx, "lead": [], "cfg": cfg})
+    for idx, cfg in emphases:
+        units.append({"kind": "emp", "idx": idx, "lead": [], "cfg": cfg})
         used |= set(idx)
-    for idx, est in hls:
+    for idx, style in highlights:
         if used & set(idx):
             continue
-        lead, k = [], idx[0] - 1               # comeco da mesma frase (ate 4 palavras; para em pontuacao)
+        lead, k = [], idx[0] - 1               # start of the same sentence (up to 4 words; stops at punctuation)
         while (k >= 0 and k not in used and words[k]["clip"] == words[idx[0]]["clip"] and len(lead) < 5
                and not re.search(r"[.!?,]$", words[k]["w"]) and words[k + 1]["s"] - words[k]["e"] <= 0.35):
             lead.insert(0, k)
             k -= 1
-        if len(lead) > 4:                      # frase longa: so as ultimas palavras (a partir de "and/when..." se houver)
+        if len(lead) > 4:                      # long sentence: only the last words (from a function word if any)
             lead = lead[-3:]
-            k = next((j for j in range(1, len(lead) - 1) if norm(words[lead[j]]["w"]) in FW8), 0)
+            k = next((j for j in range(1, len(lead) - 1) if norm(words[lead[j]]["w"]) in FUNCTION_WORDS), 0)
             lead = lead[k:]
-        units.append({"kind": est, "idx": idx, "lead": lead})
+        units.append({"kind": style, "idx": idx, "lead": lead})
         used |= set(idx) | set(lead)
+
     def split_sense(seg):
-        """frase longa -> partes por unidade de sentido: corta em virgula, nunca depois de palavra de ligacao
-        nem entre numero e unidade; partes equilibradas, ate ~40 caracteres (2 linhas)."""
+        """long sentence -> parts by unit of meaning: cut at commas, never after a function word
+        nor between a number and its unit; balanced parts, up to ~40 characters (2 lines)."""
         txt = " ".join(words[k]["w"] for k in seg)
         if (len(txt) <= 40 and len(seg) <= 8) or len(seg) < 2:
             return [seg]
@@ -529,14 +537,14 @@ def write_ass_v8(path, words, total, split_windows, imps, hls):
         def cost(c):
             a, b = " ".join(toks[:c]), " ".join(toks[c:])
             p = abs(len(a) - len(b)) / 10
-            p += 4 if norm(toks[c - 1]) in FW8 else 0
+            p += 4 if norm(toks[c - 1]) in FUNCTION_WORDS else 0
             p += 5 if re.search(r"\d", toks[c - 1]) else 0
             p -= 3 if toks[c - 1].endswith(",") else 0
             return p
         c = min(range(1, len(seg)), key=cost)
         return split_sense(seg[:c]) + split_sense(seg[c:])
 
-    cur = []                                   # legenda comum: frase inteira, ate 2 linhas
+    cur = []                                   # regular caption: whole sentence, up to 2 lines
     for i, w in enumerate(words):
         if i in used:
             continue
@@ -558,11 +566,11 @@ def write_ass_v8(path, words, total, split_windows, imps, hls):
         u["start"] = max(u["s0"], prev_end + 0.02)
         if u["kind"] == "n":
             end = min(words[last]["e"] + 0.6, nxt["s0"] - 0.02 if nxt else total)
-        else:                                   # destaque segura na tela; a proxima legenda espera (atraso <= 0.9s)
-            hold = 1.1 if u["kind"] == "imp" else 1.4
-            ref = words[last]["s"] if u["kind"] == "imp" else words[u["idx"][0]]["s"]
+        else:                                   # highlight holds on screen; the next caption waits (delay <= 0.9s)
+            hold = 1.1 if u["kind"] == "emp" else 1.4
+            ref = words[last]["s"] if u["kind"] == "emp" else words[u["idx"][0]]["s"]
             end = max(words[last]["e"] + 0.35, ref + hold)
-            if nxt:     # so segura sobre conectivo fraco ("and…"); senao a legenda seguinte atrasa no maximo 0.25s
+            if nxt:     # only holds over a weak connective ("and…"); otherwise the next caption is delayed at most 0.25s
                 weak = norm(words[nxt["first"]]["w"]) in {"and", "but", "so", "or", "then"}
                 end = min(end, nxt["s0"] + ((0.9 if weak else 0.25) if nxt["kind"] == "n" else -0.02))
         u["end"] = min(total, max(end, u["start"] + 0.5))
@@ -574,9 +582,9 @@ def write_ass_v8(path, words, total, split_windows, imps, hls):
         if u["kind"] == "n":
             toks = [words[i]["w"] for i in idx]
             num = [k for k, t in enumerate(toks) if re.search(r"\d", t)]
-            yel = {k + 1 for k in num if k + 1 < len(toks) and norm(toks[k + 1]) in UNITS8}
-            wid = lambda a, b: sum(tw8(CAP8_FILE, toks[k], fs) * (1.8 if k in num else 1) for k in range(a, b)) \
-                + tw8(CAP8_FILE, " ", fs) * (b - a - 1)
+            yel = {k + 1 for k in num if k + 1 < len(toks) and norm(toks[k + 1]) in UNITS}
+            wid = lambda a, b: sum(text_width(CAPM_FILE, toks[k], fs) * (1.8 if k in num else 1) for k in range(a, b)) \
+                + text_width(CAPM_FILE, " ", fs) * (b - a - 1)
             lines = [(0, len(toks))]
             if wid(0, len(toks)) > 600 and len(toks) > 1:
                 c = min(range(1, len(toks)), key=lambda c: (0 if toks[c - 1].endswith(",") else 1,
@@ -586,39 +594,38 @@ def write_ass_v8(path, words, total, split_windows, imps, hls):
             def fmt(k, hl):
                 t = esc(toks[k])
                 if k in num:
-                    return f"{{\\fs{int(fs * 1.8)}{'' if hl else chr(92) + '1c' + bgr8(COR8['Y'])}}}{t}{{\\fs{fs}\\1c&H00FFFFFF&}}"
+                    return f"{{\\fs{int(fs * 1.8)}{'' if hl else chr(92) + '1c' + bgr(PALETTE['Y'])}}}{t}{{\\fs{fs}\\1c&H00FFFFFF&}}"
                 if k in yel and not hl:
-                    return f"{{\\1c{bgr8(COR8['Y'])}}}{t}{{\\1c&H00FFFFFF&}}"
+                    return f"{{\\1c{bgr(PALETTE['Y'])}}}{t}{{\\1c&H00FFFFFF&}}"
                 return t
             for L, extra, hl in ((0, halo, True), (1, "", False)):
                 tx = "\\N".join(" ".join(fmt(k, hl) for k in range(a, b)) for a, b in lines)
-                ev.append(f"Dialogue: {L},{T(s)},{T(e)},S,,0,0,0,,{{\\an5\\pos({W // 2},{Y8}){extra}\\fad(120,90)}}{tx}")
+                ev.append(f"Dialogue: {L},{T(s)},{T(e)},S,,0,0,0,,{{\\an5\\pos({W // 2},{Y_CENTER}){extra}\\fad(120,90)}}{tx}")
             if num:
                 sfx.append((words[idx[num[0]]]["s"], "pop02", -18, 1))
         elif u["kind"] in ("hl", "lock"):
             lead = " ".join(words[i]["w"] for i in u["lead"])
             big = re.sub(r"[.,;:]+$", "", " ".join(words[i]["w"] for i in idx)).upper()
-            if u["kind"] == "lock":                  # lockup: Montserrat Bold caixa alta
+            if u["kind"] == "lock":                  # lockup: Montserrat Bold upper case
                 bl, bfs = [big], 96
                 bh = bfs * 1.0
-            else:                                    # amarelo grande da v7 (League Gothic), 2 linhas se longo
+            else:                                    # big yellow (League Gothic), 2 lines if long
                 toks = big.split()
                 bl = [big]
                 if len(big) > 14 and len(toks) > 1:
                     c = min(range(1, len(toks)), key=lambda c: abs(len(" ".join(toks[:c])) - len(" ".join(toks[c:]))))
                     bl = [" ".join(toks[:c]), " ".join(toks[c:])]
-                bfs = int(min(170, 640 / max(tw8(LG8_FILE, l, 100) for l in bl) * 100))
+                bfs = int(min(170, 640 / max(text_width(LG_FILE, l, 100) for l in bl) * 100))
                 bh = bfs * 0.86 * (len(bl) - 1) + bfs * 0.75
-            # bloco compacto e centrado no quadro; pode atravessar a costura do split (Felipe: "nao precisa
-            # considerar a divisoria tao estritamente" — palavras longe uma da outra ficou ruim)
+            # compact block centred in the frame; may cross the split seam (words far apart read badly)
             lh = 58 if lead else 0
-            top = Y8 + globals().get("HL_DY", 0) - (lh + bh) / 2   # HL_DY (job_config): desce o destaque quando o rosto e grande (AD02)
+            top = Y_CENTER + globals().get("HL_DY", 0) - (lh + bh) / 2   # HL_DY (job_config): lowers the highlight when the face is large
             if lead:
                 for L, extra in ((0, halo), (1, "")):
                     ev.append(f"Dialogue: {L},{T(s)},{T(e)},S,,0,0,0,,{{\\an5\\pos({W // 2},{top + lh / 2:.0f}){extra}\\fad(120,90)}}{esc(lead)}")
             t_big = max(s, words[idx[0]]["s"])
             big_halo = halo.replace("bord8", "bord12").replace("blur10", "blur16")
-            pitch = bfs * 0.86            # cada linha em evento proprio: \N usa a entrelinha alta da League Gothic
+            pitch = bfs * 0.86            # each line in its own event: \N uses the tall League Gothic leading
             for li, l in enumerate(bl):
                 yl = top + lh + bfs * 0.375 + li * pitch
                 if u["kind"] == "lock":
@@ -626,38 +633,38 @@ def write_ass_v8(path, words, total, split_windows, imps, hls):
                 else:
                     sty, fx = "L", (f"\\fs{bfs}\\pos({W // 2},{yl:.0f})\\fscx80\\fscy80\\t(0,90,\\fscx106\\fscy106)"
                                     f"\\t(90,170,\\fscx100\\fscy100)")
-                for L, extra in ((2, big_halo), (3, f"\\1c{bgr8(COR8['Y'])}\\shad3")):
+                for L, extra in ((2, big_halo), (3, f"\\1c{bgr(PALETTE['Y'])}\\shad3")):
                     ev.append(f"Dialogue: {L},{T(t_big)},{T(e)},{sty},,0,0,0,,{{\\an5{fx}{extra}\\fad(80,90)}}{esc(l)}")
             sfx.append((t_big, "pop02" if re.search(r"\d", big) else "click05", -18, 1))
-        else:                                        # impacto de tela cheia
+        else:                                        # full-screen emphasis
             cfg = u["cfg"]
             up = [re.sub(r",$", "", words[i]["w"]).upper() for i in idx]
             keys = [norm(words[i]["w"]) for i in idx]
-            cor, grande = cfg.get("cor", {}), cfg.get("grande", set())
+            colours, big_words = cfg.get("colours", {}), cfg.get("big", set())
             lines, k0 = [], 0
-            for c in cfg.get("linhas", [len(up)]):
+            for c in cfg.get("lines", [len(up)]):
                 lines.append(list(range(k0, min(k0 + c, len(up)))))
                 k0 += c
             lfs = []
             for line in lines:
-                fit = 650 / tw8(LG8_FILE, " ".join(up[k] for k in line), 100) * 100
-                forte = any(keys[k] in cor or keys[k] in grande for k in line)
-                so_num = len(line) == 1 and re.search(r"\d", up[line[0]])     # "$5" sozinho na linha: gigante
-                lfs.append(min(fit, 340 if (forte and so_num) else 250 if forte else 165))
+                fit = 650 / text_width(LG_FILE, " ".join(up[k] for k in line), 100) * 100
+                strong = any(keys[k] in colours or keys[k] in big_words for k in line)
+                single_number = len(line) == 1 and re.search(r"\d", up[line[0]])     # a number alone on its line: giant
+                lfs.append(min(fit, 340 if (strong and single_number) else 250 if strong else 165))
             sc = min(1.0, 640 / (0.80 * sum(lfs)))
             lfs = [int(f * sc) for f in lfs]
             hs = [0.80 * f for f in lfs]
             ytop = 505 - sum(hs) / 2
             for li, line in enumerate(lines):
                 f_ = lfs[li]
-                sp = tw8(LG8_FILE, " ", f_)
-                x = W / 2 - tw8(LG8_FILE, " ".join(up[k] for k in line), f_) / 2
+                sp = text_width(LG_FILE, " ", f_)
+                x = W / 2 - text_width(LG_FILE, " ".join(up[k] for k in line), f_) / 2
                 for k in line:
-                    wk = tw8(LG8_FILE, up[k], f_)
+                    wk = text_width(LG_FILE, up[k], f_)
                     cx, cy = x + wk / 2, ytop + sum(hs[:li]) + hs[li] / 2
                     x += wk + sp
                     t0 = max(s, words[idx[k]]["s"])
-                    col = bgr8(COR8[cor.get(keys[k], "W")])
+                    col = bgr(PALETTE[colours.get(keys[k], "W")])
                     base = (f"\\an5\\pos({cx:.0f},{cy:.0f})\\fs{f_}\\fscx55\\fscy55\\t(0,110,\\fscx112\\fscy112)"
                             f"\\t(110,200,\\fscx100\\fscy100)\\fad(40,140)")
                     ev.append(f"Dialogue: 4,{T(t0)},{T(e)},L,,0,0,0,,{{{base}\\1a&HFF&\\bord14\\blur18\\3c&H000000&\\3a&H60&}}{esc(up[k])}")
@@ -672,8 +679,8 @@ def write_ass_v8(path, words, total, split_windows, imps, hls):
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: S,{CAP8_FAM},{fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,0,2.5,5,0,0,0,1",
-        f"Style: L,{LG8_FAM},120,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1",
+        f"Style: S,{CAPM_FAM},{fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,0,2.5,5,0,0,0,1",
+        f"Style: L,{LG_FAM},120,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1",
         "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
     with open(path, "w", encoding="utf-8") as f:
@@ -696,17 +703,17 @@ def build(letter, bank):
     starts = [phrase_window(words, hook, ph, total)[0] for _, ph in hs]
     for i, (key, _) in enumerate(hs):
         ov.append({"key": key, "a": starts[i], "b": starts[i + 1] if i + 1 < len(hs) else hook_end, "mode": "split"})
-    splits = [(starts[0], hook_end)] if starts else []   # hook sem b-roll (HOOK_SPLITS vazio) = sem painel dividido
-    for key, clip, ph in BODY_BROLL + PILLS_BODY.get(letter, []):
+    splits = [(starts[0], hook_end)] if starts else []   # hook without b-roll (HOOK_SPLITS empty) = no split panel
+    for key, clip, ph in BODY_BROLL + EXTRA_BODY_BROLL.get(letter, []):
         try:
             a, b, _ = phrase_window(words, clip, ph, total)
         except ValueError as e:
-            print("AVISO:", e)
+            print("WARNING:", e)
             continue
-        # BODY_SPLIT (AD02 carro): b-roll do body no painel de baixo, rosto em cima, em vez de tela cheia
+        # BODY_SPLIT: body b-roll in the bottom panel with the face on top, instead of full screen
         ov.append({"key": key, "a": a, "b": max(b, a + 1.8), "mode": "split" if globals().get("BODY_SPLIT") else "full"})
 
-    # lip-sync quebrado -> cobertura (prioridade sobre b-roll normal)
+    # broken lip-sync -> coverage (priority over regular b-roll)
     with open(lipsync_file(), encoding="utf-8") as f:
         lips = json.load(f)
     broken = []
@@ -718,16 +725,16 @@ def build(letter, bank):
                 broken.append((clip, ta, tb))
     for clip, ta, tb in broken:
         a, b = ta - COVER_PAD, tb + COVER_PAD
-        cov = {**COVER, **globals().get("COVER8", {})} if is_v8() else COVER
-        keys = cov.get(clip, ["honey"])
-        if keys is None:                       # v8: coberto por impacto com blur (IMPACT8), sem b-roll
+        cov = {**COVER, **globals().get("COVER_CENTERED", {})} if is_centered() else COVER
+        keys = cov.get(clip, globals().get("COVER_DEFAULT", []))
+        if not keys:                           # covered by a blurred emphasis instead (EMPHASIS), or nothing declared
             continue
         parts = keys if b - a > 3.0 and len(keys) > 1 else keys[:1]
         step = (b - a) / len(parts)
         for i, k in enumerate(parts):
             ov.append({"key": k, "a": a + i * step, "b": a + (i + 1) * step, "mode": "cover"})
 
-    # resolve sobreposicao: cover vence
+    # resolve overlaps: cover wins
     ov.sort(key=lambda o: (o["a"], o["mode"] != "cover"))
     res = []
     for o in ov:
@@ -744,7 +751,7 @@ def build(letter, bank):
     res = [o for o in res if o["b"] - o["a"] > 0.25]
     res.sort(key=lambda o: o["a"])
 
-    # nenhum bloco sem rosto > 7s: encurta o ultimo b-roll normal do bloco
+    # no faceless block longer than MAX_FACELESS: shortens the last regular b-roll of the block
     blk = []
     for o in res + [None]:
         if o is not None and o["mode"] != "split" and blk and o["a"] - blk[-1]["b"] < 0.1:
@@ -757,51 +764,52 @@ def build(letter, bank):
                     break
         blk = [o] if o is not None and o["mode"] != "split" else []
     overlays = res
-    if globals().get("BODY_SPLIT"):    # painel de rosto em cima so onde ha b-roll embaixo (depois de cortes/coberturas)
+    if globals().get("BODY_SPLIT"):    # face panel on top only where there is b-roll below (after cuts/coverage)
         splits += [(o["a"], o["b"]) for o in overlays if o["mode"] == "split" and o["a"] >= hook_end - 1e-3]
 
-    # nenhum arquivo de remedio repetido no mesmo video
-    pill_files = [BROLL[o["key"]][0] for o in overlays if o["key"].startswith("pills")]
-    assert len(pill_files) == len(set(pill_files)), f"remedio repetido em {letter}: {pill_files}"
+    # no b-roll file from the UNIQUE_BROLL_PREFIX group repeated in the same video
+    prefix = globals().get("UNIQUE_BROLL_PREFIX", "product")
+    unique_files = [BROLL[o["key"]][0] for o in overlays if o["key"].startswith(prefix)]
+    assert len(unique_files) == len(set(unique_files)), f"repeated '{prefix}' file in {letter}: {unique_files}"
 
-    # relatorio lip-sync antes (v3) / depois (v4)
+    # lip-sync report: coverage before (previous plan, if any) / after
     iv = [(ta, tb) for _, ta, tb in broken]
-    v3 = []
-    p3 = os.path.join(V3PLAN, f"plano_{letter}.json")
-    if os.path.exists(p3):
-        with open(p3, encoding="utf-8") as f:
-            v3 = [{"a": o["de"], "b": o["ate"], "mode": o["modo"]} for o in json.load(f)["broll"]]
-    before, after = coverage(iv, v3), coverage(iv, overlays)
+    previous = []
+    pp = os.path.join(PREVIOUS_PLAN, f"plan_{letter}.json")
+    if os.path.exists(pp):
+        with open(pp, encoding="utf-8") as f:
+            previous = [{"a": o["from"], "b": o["to"], "mode": o["mode"]} for o in json.load(f)["broll"]]
+    before, after = coverage(iv, previous), coverage(iv, overlays)
     REPORT.append((letter, broken, before, after))
 
-    # impactos v6: frase LITERAL palavra a palavra (kinetic.py), scrim opcional, icone opcional
-    impacts, k_events, k_cov, scrims, icons, k_sfx = [], [], [], [], [], []
-    hl7 = globals().get("HIGHLIGHT")
+    # kinetic phrases: LITERAL phrase word by word (kinetic.py), optional scrim, optional icon
+    callouts, k_events, k_cov, scrims, icons, k_sfx = [], [], [], [], [], []
+    highlights = globals().get("HIGHLIGHT")
     clips_here = {w["clip"] for w in words}
     hl_idx = set()
-    for clip, ph in (hl7 or []):
+    for clip, ph in (highlights or []):
         if clip in clips_here:
             hl_idx.update(find_phrase(words, clip, ph))
-    v6 = None if hl7 else globals().get("IMPACT6")
-    if v6:
+    kinetic_phrases = None if highlights else globals().get("KINETIC_PHRASES")
+    if kinetic_phrases:
         found = []
-        for it in v6:
+        for it in kinetic_phrases:
             if not any(w["clip"] == it["clip"] for w in words):
                 continue
             try:
                 a, b, idx = phrase_window(words, it["clip"], it["phrase"], total)
             except ValueError as e:
-                print("AVISO:", e)
+                print("WARNING:", e)
                 continue
             found.append((a, b, idx, it))
         found.sort(key=lambda x: x[0])
         for n_, (a, b, idx, it) in enumerate(found):
             nxt = found[n_ + 1][0] if n_ + 1 < len(found) else total
             last_t = words[idx[-1]]["s"]
-            end = min(max(b + 0.35, last_t + it.get("hold", 1.1)), nxt - 0.05, total)   # ultima palavra fica >= hold
+            end = min(max(b + 0.35, last_t + it.get("hold", 1.1)), nxt - 0.05, total)   # last word stays >= hold
             toks = kinetic.tokens_from_words([words[i] for i in idx])
             times = [words[i]["s"] for i in idx]
-            colors = {k: COLORS6[c] for k, t in enumerate(toks) for w_, c in it.get("accent", {}).items()
+            colors = {k: COLORS_KINETIC[c] for k, t in enumerate(toks) for w_, c in it.get("accent", {}).items()
                       if t.strip("?!") in w_.upper().split()}
             big = {k: f for k, t in enumerate(toks) for w_, f in it.get("big", {}).items() if t == w_.upper()}
             icon = None
@@ -829,34 +837,33 @@ def build(letter, bank):
                 k_sfx.append((hit, it["sfx"], it.get("sfx_db", -15)))
                 if it.get("riser"):
                     k_sfx.append((hit - 0.85, "riser", -17))
-    elif not hl7:
-        for clip, ph, lead, bigt, kind, color in IMPACT:
+    elif not highlights:
+        for clip, ph, lead, bigt, kind, color in CALLOUTS:
             if not any(w["clip"] == clip for w in words):
                 continue
             try:
                 a, b, idx = phrase_window(words, clip, ph, total)
             except ValueError as e:
-                print("AVISO:", e)
+                print("WARNING:", e)
                 continue
-            impacts.append((a, b, idx, lead, bigt, kind, color))
-        impacts.sort(key=lambda x: x[0])
-    cards = [(x[0], max(x[1], x[0] + 1.0)) for x in impacts if x[5] == "card"]
+            callouts.append((a, b, idx, lead, bigt, kind, color))
+        callouts.sort(key=lambda x: x[0])
+    cards = [(x[0], max(x[1], x[0] + 1.0)) for x in callouts if x[5] == "card"]
 
     os.makedirs(WORK, exist_ok=True)
-    ass_name = f"legenda_{letter}.ass"
-    first_split = next((o for o in overlays if o["mode"] == "split" and o["a"] < hook_end), None)   # flash so na entrada do split do hook
-    blur8 = []
-    if is_v8():
-        imps = [(find_phrase(words, it["clip"], it["phrase"]), it) for it in IMPACT8 if it["clip"] in clips_here]
-        sty8 = globals().get("HIGHLIGHT8_STYLE", {})
-        hls = [(find_phrase(words, clip, ph), sty8.get((clip, ph), "hl")) for clip, ph in (hl7 or []) if clip in clips_here]
-        blur8, cand = write_ass_v8(os.path.join(WORK, ass_name), words, total, splits, imps, hls)
-        # impacto com b-roll atras (full, cover ou painel do split): sem blur/escurecimento, para ver o b-roll e o
-        # avatar (Felipe, 15/10); blur so quando o fundo e so o avatar
-        # (AD02: se o b-roll so cobre PARTE da janela, o blur continua no trecho que e so avatar — antes a janela inteira
-        # perdia o blur e o texto ficava sobre o rosto nitido, ex. "REVERSE ALZHEIMER'S" nos oculos)
+    ass_name = f"captions_{letter}.ass"
+    first_split = next((o for o in overlays if o["mode"] == "split" and o["a"] < hook_end), None)   # flash only on the hook's split entry
+    blur_windows = []
+    if is_centered():
+        emphases = [(find_phrase(words, it["clip"], it["phrase"]), it) for it in EMPHASIS if it["clip"] in clips_here]
+        styles = globals().get("HIGHLIGHT_STYLE", {})
+        hls = [(find_phrase(words, clip, ph), styles.get((clip, ph), "hl")) for clip, ph in (highlights or []) if clip in clips_here]
+        blur_windows, cand = write_ass_centered(os.path.join(WORK, ass_name), words, total, splits, emphases, hls)
+        # emphasis with b-roll behind it (full, cover or split panel): no blur/darkening, so the b-roll and the
+        # presenter stay visible; blur only where the background is the presenter alone. If b-roll covers only
+        # PART of the window, the blur stays on the presenter-only stretch.
         nb = []
-        for a, b in blur8:
+        for a, b in blur_windows:
             segs = [(a, b)]
             for o in overlays:
                 nxt = []
@@ -870,19 +877,19 @@ def build(letter, bank):
                         nxt.append((sa, sb))
                 segs = nxt
             nb += segs
-        blur8 = nb
-        # relatorio de lip-sync conta o blur do impacto como cobertura
-        REPORT[-1] = (letter, broken, before, coverage(iv, overlays + [{"a": a, "b": b, "mode": "cover"} for a, b in blur8]))
-        # sons v8: looming na abertura, flash na entrada do split, sons dos impactos (prioridade 0) e POP 02/CLICK 05 dos
-        # destaques pequenos so se nao houver outro som a menos de 3s (SFX enxuto)
+        blur_windows = nb
+        # the lip-sync report counts the emphasis blur as coverage
+        REPORT[-1] = (letter, broken, before, coverage(iv, overlays + [{"a": a, "b": b, "mode": "cover"} for a, b in blur_windows]))
+        # centered-style sounds: looming at the open, flash on the split entry, emphasis sounds (priority 0) and
+        # POP 02 / CLICK 05 for small highlights only when no other sound is within 3 s (lean SFX)
         ev = [(0.0, "looming", -15)]
         if first_split:
             ev.append((first_split["a"] - 0.03, "flash", -12))
         for t, cat, g, pri in sorted(cand, key=lambda x: (x[3], x[0])):
             if pri == 0 or all(abs(t - t2) > 3.0 for t2, _, _ in ev):
                 ev.append((t, cat, g))
-        # BROLL_SFX (job_config): whoosh/swipe suave na entrada do b-roll do body, alternando os sons do banco v8, so com
-        # folga de outros sons (AD02 carro, Felipe 20/10: "senti falta dos efeitos sonoros")
+        # BROLL_SFX (job_config): soft whoosh/swipe on each body b-roll entry, alternating the bank sounds,
+        # only with clearance from other sounds
         bs = globals().get("BROLL_SFX")
         if bs:
             k = 0
@@ -890,13 +897,14 @@ def build(letter, bank):
                 if o["a"] >= hook_end - 1e-3 and all(abs(o["a"] - t2) > bs["gap"] for t2, _, _ in ev):
                     ev.append((o["a"] - 0.12, bs["cats"][k % len(bs["cats"])], bs["db"]))
                     k += 1
-    elif hl7:
-        write_ass_v7(os.path.join(WORK, ass_name), words, total, splits, hl_idx)
-        # SFX v7: looming na abertura, flash na entrada do split e nos trechos do SFX7, clock em tempo, cymbal antes do CTA
+    elif highlights:
+        write_ass_condensed(os.path.join(WORK, ass_name), words, total, splits, hl_idx)
+        # condensed-style SFX: looming at the open, flash on the split entry and on SFX_CONDENSED entries,
+        # clock on time references, cymbal before the closing call
         ev = [(0.0, "looming", -17)]
         if first_split:
             ev.append((first_split["a"] - 0.03, "flash", -13))
-        for clip, ph, cat, db in SFX7:
+        for clip, ph, cat, db in SFX_CONDENSED:
             if clip not in clips_here:
                 continue
             t0 = words[find_phrase(words, clip, ph)[0]]["s"]
@@ -904,17 +912,17 @@ def build(letter, bank):
             if ph.startswith("tap"):
                 ev.append((t0 - 1.74, "cymbal", -16))
     else:
-        write_ass(os.path.join(WORK, ass_name), words, total, splits, impacts, k_events, k_cov)
-        # SFX enxuto: abertura, entrada do split, cartoes, 1-2 manchetes de dor no hook, CTA
+        write_ass_classic(os.path.join(WORK, ass_name), words, total, splits, callouts, k_events, k_cov)
+        # lean SFX: opening, split entry, cards, 1-2 red headlines in the hook, closing call
         ev = [(0.0, "impact", -10), (0.0, "whoosh", -15)]
         if first_split:
             ev.append((first_split["a"], "whoosh", -17))
         for a, b in cards:
             ev.append((a - 0.05, "swoosh", -14))
-        hook_pain = [x for x in impacts if x[2] and words[x[2][0]]["clip"] == hook and x[5] == "head" and x[6] == "R"]
-        for x in hook_pain[:2]:
+        hook_red = [x for x in callouts if x[2] and words[x[2][0]]["clip"] == hook and x[5] == "head" and x[6] == "R"]
+        for x in hook_red[:2]:
             ev.append((x[0], "pop", -17))
-        for x in impacts:
+        for x in callouts:
             if x[4].lower().startswith("tap"):
                 ev.append((x[0] - 0.85, "riser", -15))
                 ev.append((x[0], "impact", -12))
@@ -925,9 +933,9 @@ def build(letter, bank):
     fdir = os.path.join(WORK, "fonts")
     os.makedirs(fdir, exist_ok=True)
     import shutil
-    for ff in ([CAP8_FILE, LG8_FILE] if is_v8() else [CAP7_FILE] if hl7 else []):
+    for ff in ([CAPM_FILE, LG_FILE] if is_centered() else [CAPC_FILE] if highlights else []):
         if not os.path.exists(os.path.join(fdir, ff)):
-            shutil.copy(os.path.join(LIB, "fontes", ff), fdir)
+            shutil.copy(os.path.join(LIB, "fonts", ff), fdir)
     sfx_path = os.path.join(WORK, f"sfx_{letter}.wav")
     used = build_sfx_track(bank, ev, total, sfx_path)
     grad = os.path.join(ASSETS, "gradient.png")
@@ -939,7 +947,7 @@ def build(letter, bank):
     n = len(timeline)
     for o in overlays:
         f_, src, _, ext_ = BROLL[o["key"]]
-        sl = ext_.get("slow", 1.0)      # slow (job_config): camera lenta; le so (dur / slow) da fonte, para nao sair da janela limpa
+        sl = ext_.get("slow", 1.0)      # slow (job_config): slow motion; reads only (dur / slow) of the source to stay in the clean window
         cmd += ["-ss", f"{src:.3f}", "-t", f"{(o['b'] - o['a']) / sl + (0.5 if sl == 1.0 else 0.05):.3f}", "-i", asset_path(f_)]
     i_sfx = n + len(overlays)
     cmd += ["-i", sfx_path, "-i", grad]
@@ -949,7 +957,7 @@ def build(letter, bank):
         Image_ = __import__("PIL.Image", fromlist=["Image"])
         Image_.new("RGBA", (W, H), (6, 6, 10, 150)).save(scrim_png)
     i_scr = i_grad + 1
-    if scrims:                      # 1 entrada so; repetida no filtro (PNG em -loop 1 trava o ffmpeg)
+    if scrims:                      # a single input, repeated in the filter (a PNG with -loop 1 stalls ffmpeg)
         cmd += ["-i", scrim_png]
     i_ico = i_scr + (1 if scrims else 0)
     for mov, a, b, x, y in icons:
@@ -960,7 +968,7 @@ def build(letter, bank):
         z = PUNCH if i % 2 else 1.0
         sw = int(round(W * z / 2) * 2)
         sh = int(round(sw * 736 / 400 / 2) * 2)
-        chain = f"[{i}:v]{FIX},scale={sw}:{sh},crop={W}:{H}:(iw-{W})/2:(ih-{H})*0.35,fps={FPS},setsar=1"
+        chain = f"[{i}:v]{COLOR},scale={sw}:{sh},crop={W}:{H}:(iw-{W})/2:(ih-{H})*0.35,fps={FPS},setsar=1"
         if i == 0:
             chain += (f",scale=w='trunc({W}*(1+0.22*pow(max(0\\,1-t/0.45)\\,2))/2)*2':h=-2:eval=frame,"
                       f"crop={W}:{H},fade=in:st=0:d=0.22:color=white")
@@ -974,8 +982,7 @@ def build(letter, bank):
     en = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in splits) or "0"
     cw, ch = int(W / SPLIT_ZOOM) // 2 * 2, int(PH / SPLIT_ZOOM) // 2 * 2
     fc.append("[base]split[b0][b1]")
-    # SPLIT_TOP_Y (job_config): onde o painel de cima comeca no quadro do avatar; AD02 carro = 180 (rosto mais baixo:
-    # em 24 a costura e a legenda tampavam boca e queixo)
+    # SPLIT_TOP_Y (job_config): where the top panel starts in the presenter frame (raise it when the face sits low)
     fc.append(f"[b1]crop={cw}:{ch}:({W}-{cw})/2:{globals().get('SPLIT_TOP_Y', 24)},scale={W}:{PH}[top]")
     fc.append(f"[b0][top]overlay=0:0:enable='{en}'[s0]")
     last = "s0"
@@ -986,9 +993,9 @@ def build(letter, bank):
         tw, tth = int(W * zx) // 2 * 2, int(th * zx) // 2 * 2
         blur = f",gblur=sigma={ext['blur']}" if ext.get("blur") else ""
         nfr = max(2, int((o["b"] - o["a"] + 0.5) * FPS))
-        pre = f",crop={ext['precrop']}" if ext.get("precrop") else ""   # remove tarja preta da fonte
+        pre = f",crop={ext['precrop']}" if ext.get("precrop") else ""   # removes black bars from the source
         slow = f",setpts={ext['slow']}*PTS" if ext.get("slow") else ""
-        chain = (f"{FIX}{pre},scale={tw}:{tth}:force_original_aspect_ratio=increase,crop={W}:{th}:(iw-{W})/2:(ih-{th})*{anc}"
+        chain = (f"{COLOR}{pre},scale={tw}:{tth}:force_original_aspect_ratio=increase,crop={W}:{th}:(iw-{W})/2:(ih-{th})*{anc}"
                  f"{blur}{slow},fps={FPS},setsar=1,tpad=stop_mode=clone:stop_duration=3,"
                  f"scale={W * 2}:{th * 2},zoompan=z='1+0.06*on/{nfr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
                  f":d=1:s={W}x{th}:fps={FPS},setpts=PTS-STARTPTS+{o['a']:.3f}/TB")
@@ -1013,17 +1020,17 @@ def build(letter, bank):
         fc.append(f"[{lastg}][ic{k}]overlay={x}:{y}:eof_action=pass[gi{k}]")
         lastg = f"gi{k}"
     fc.append(f"[{lastg}]null[gr]")
-    if blur8:              # impacto v8: o proprio video com blur forte + escurecido so na janela (trim = barato)
-        fc.append(f"[gr]split={len(blur8) + 1}[gq]" + "".join(f"[gc{k}]" for k in range(len(blur8))))
+    if blur_windows:       # emphasis: the video itself strongly blurred + darkened only inside the window (trim = cheap)
+        fc.append(f"[gr]split={len(blur_windows) + 1}[gq]" + "".join(f"[gc{k}]" for k in range(len(blur_windows))))
         lq = "gq"
-        for k, (a, b) in enumerate(blur8):
+        for k, (a, b) in enumerate(blur_windows):
             fc.append(f"[gc{k}]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS,gblur=sigma=26,"
                       f"eq=brightness=-0.20:saturation=0.85,format=yuva420p,fade=t=in:st=0:d=0.15:alpha=1,"
                       f"fade=t=out:st={max(0, b - a - 0.15):.3f}:d=0.15:alpha=1,setpts=PTS+{a:.3f}/TB[gb{k}]")
             fc.append(f"[{lq}][gb{k}]overlay=0:0:eof_action=pass[gz{k}]")
             lq = f"gz{k}"
         fc.append(f"[{lq}]format=yuv420p[grb]")
-    glab = "grb" if blur8 else "gr"
+    glab = "grb" if blur_windows else "gr"
     boxes = "".join(f"drawbox=color=0x0b0b0d@0.94:t=fill:enable='between(t,{a:.3f},{b:.3f})',"
                     f"drawbox=color=white@0.55:t=fill:enable='between(t,{b:.3f},{b + 0.07:.3f})',"
                     for a, b in cards)
@@ -1036,13 +1043,14 @@ def build(letter, bank):
               "loudnorm=I=-14:TP=-1.5:LRA=9,aresample=48000[aout]")
 
     var = "_" + VARIANT.upper() if VARIANT else ""
-    out = os.path.join(OUT, f"{PREFIX}_CLONE_HOOK_{letter}{var}_720p_{'v8' if is_v8() else 'v7'}.mp4")
-    limit = float(os.environ.get("V7_TEST", 0)) or total
-    if os.environ.get("V7_TEST"):
-        out = os.path.join(WORK, f"teste_{letter}.mp4")
-    frm = ["-ss", os.environ["V7_FROM"]] if os.environ.get("V7_FROM") else []
-    # filtro em arquivo: com muitos b-rolls (AD02 carro) a linha passa do limite do Windows (WinError 206)
-    fc_name = f"filtro_{letter}.txt"
+    style = "centered" if is_centered() else "condensed" if highlights else "classic"
+    out = os.path.join(OUT, f"{PREFIX}_HOOK_{letter}{var}_720p_{style}.mp4")
+    limit = float(os.environ.get("TEST_SECONDS", 0)) or total
+    if os.environ.get("TEST_SECONDS"):
+        out = os.path.join(WORK, f"test_{letter}.mp4")
+    frm = ["-ss", os.environ["TEST_FROM"]] if os.environ.get("TEST_FROM") else []
+    # filter graph in a file: with many b-rolls the command line exceeds the Windows limit
+    fc_name = f"filter_{letter}.txt"
     with open(os.path.join(WORK, fc_name), "w", encoding="utf-8") as f:
         f.write(";\n".join(fc))
     cmd += ["-/filter_complex", fc_name, "-map", "[vout]", "-map", "[aout]"] + frm + ["-t", f"{limit:.3f}",
@@ -1050,28 +1058,28 @@ def build(letter, bank):
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", out]
     run(cmd, cwd=WORK)
 
-    plan = {"versao": letter, "duracao": round(total, 2),
-            "broll": [{"b": o["key"], "arquivo": BROLL[o["key"]][0], "de": round(o["a"], 2), "ate": round(o["b"], 2),
-                       "modo": o["mode"]} for o in overlays],
-            "impactos": len(k_cov) or len(impacts), "scrims": len(scrims), "icones": len(icons),
-            "sfx": [{"t": u[0], "cat": u[1], "arquivo": u[2], "db": u[3]} for u in used]}
-    with open(os.path.join(WORK, f"plano_{letter}.json"), "w", encoding="utf-8") as f:
+    plan = {"version": letter, "duration": round(total, 2),
+            "broll": [{"key": o["key"], "file": BROLL[o["key"]][0], "from": round(o["a"], 2), "to": round(o["b"], 2),
+                       "mode": o["mode"]} for o in overlays],
+            "emphases": len(k_cov) or len(callouts), "scrims": len(scrims), "icons": len(icons),
+            "sfx": [{"t": u[0], "cat": u[1], "file": u[2], "db": u[3]} for u in used]}
+    with open(os.path.join(WORK, f"plan_{letter}.json"), "w", encoding="utf-8") as f:
         json.dump(plan, f, indent=2, ensure_ascii=False)
-    print(f"{letter}: {total:.1f}s | b-rolls {len(overlays)} | impactos {len(k_cov) or len(impacts)} (scrims {len(scrims)}, icones {len(icons)}) | sfx {len(used)}")
+    print(f"{letter}: {total:.1f}s | b-rolls {len(overlays)} | emphases {len(k_cov) or len(callouts)} (scrims {len(scrims)}, icons {len(icons)}) | sfx {len(used)}")
 
 
 def write_report():
-    lines = [f"RELATORIO LIP-SYNC — {PREFIX}", "",
-             "Deteccao: lipsync.py — rastreio da cabeca por template + movimento da boca alinhada a 15fps,",
-             "fala ativa = palavras do Whisper; quebrado = fala com boca parada (< 38% da mediana) por > 0.4s.", ""]
+    lines = [f"LIP-SYNC REPORT — {PREFIX}", "",
+             "Detection: lipsync.py — head tracking by template + aligned mouth motion at 15 fps,",
+             "active speech = transcriber words; broken = speech with a still mouth (< 38% of the median) for > 0.4 s.", ""]
     for letter, broken, before, after in REPORT:
-        lines.append(f"VERSAO {letter}")
+        lines.append(f"VERSION {letter}")
         for (clip, a, b), x, y in zip(broken, before, after):
             m = lambda t: f"{int(t // 60)}:{t % 60:05.2f}"
-            lines.append(f"  {clip:7s} {m(a)} - {m(b)}  ({b - a:.2f}s)   antes: {x * 100:5.1f}% coberto   "
-                         f"depois: {y * 100:5.1f}% coberto")
+            lines.append(f"  {clip:7s} {m(a)} - {m(b)}  ({b - a:.2f}s)   before: {x * 100:5.1f}% covered   "
+                         f"after: {y * 100:5.1f}% covered")
         lines.append("")
-    partial = os.environ.get("V7_TEST") or len(REPORT) < len(VERSIONS)   # teste/parcial nao sobrescreve o oficial
+    partial = os.environ.get("TEST_SECONDS") or len(REPORT) < len(VERSIONS)   # a test/partial run does not overwrite the official report
     name = f"lipsync_report{'_' + VARIANT if VARIANT else ''}.txt"
     with open(os.path.join(WORK if partial else OUT, name), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -1080,7 +1088,7 @@ def write_report():
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        sys.exit("uso: python motor/montar.py jobs/<job> [A B C]")
+        sys.exit("usage: python assembly/assemble.py jobs/<job> [A B C]")
     load_job(sys.argv[1])
     bank = SfxBank(seed=7)
     for v in (sys.argv[2:] or VERSIONS):

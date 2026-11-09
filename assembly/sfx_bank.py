@@ -1,8 +1,9 @@
-﻿"""Banco de SFX reais (Mixkit, licenca livre sem atribuicao) para a montagem v4.
+"""Builds the sound-effect bank from a free library (Mixkit, free licence without attribution).
 
-Para cada sample: baixa (wav; fallback preview mp3), corta silencio inicial (transiente no frame),
-limita a duracao por categoria, normaliza pico em -1 dBFS, fade-out curto, salva 48k estereo em
-sfx/bank/<categoria>/<categoria>_NN_<id>.wav e registra tudo em sfx/LICENCAS.txt.
+For each sample: downloads it (wav; falls back to the mp3 preview), trims the leading silence (the
+transient lands on the frame), limits the duration per category, normalises the peak to -1 dBFS, applies
+a short fade-out, saves 48 kHz stereo to library/sfx/bank/<category>/<category>_NN_<id>.wav and records
+everything in library/sfx/LICENSES.txt.
 """
 import os
 import subprocess
@@ -11,14 +12,14 @@ import wave
 
 import numpy as np
 
-OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "biblioteca", "sfx")
+OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "library", "sfx")
 RAW = os.path.join(OUT, "raw")
 BANK = os.path.join(OUT, "bank")
 SR = 48000
 
-# categoria -> (duracao maxima em s, modo de corte, [(id, nome)])
-#   modo "head": comeca no transiente | "tail": pega o final que termina no pico (risers)
-CATS = {
+# category -> (max duration in s, trim mode, [(id, name)])
+#   mode "head": starts at the transient | "tail": keeps the ending that finishes on the peak (risers)
+CATEGORIES = {
     "whoosh_s": (1.0, "head", [(1492, "cinematic whoosh fast transition"), (1491, "arrow whoosh"),
                                (1490, "fast whoosh transition"), (166, "fast small sweep transition"),
                                (175, "short transition sweep"), (3115, "fast transitions swoosh"),
@@ -57,7 +58,7 @@ def fetch(sid):
         except Exception:
             if os.path.exists(p):
                 os.remove(p)
-    raise RuntimeError(f"falha ao baixar {sid}")
+    raise RuntimeError(f"failed to download {sid}")
 
 
 def decode(path):
@@ -97,12 +98,12 @@ def save(path, x):
 
 
 if __name__ == "__main__":
-    lic = ["BANCO DE SFX — AD01 v4", "",
-           "Fonte: Mixkit (https://mixkit.co/free-sound-effects/)",
-           "Licenca: Mixkit Sound Effects Free License — uso comercial e pessoal gratuito, sem atribuicao obrigatoria.",
-           "Termos: https://mixkit.co/license/#sfxFree", "",
-           "Processamento: corte de silencio inicial, limite de duracao por categoria, pico -1 dBFS, fade-out 40ms.", ""]
-    for cat, (max_d, mode, items) in CATS.items():
+    lic = ["SFX BANK", "",
+           "Source: Mixkit (https://mixkit.co/free-sound-effects/)",
+           "Licence: Mixkit Sound Effects Free License — free for commercial and personal use, no attribution required.",
+           "Terms: https://mixkit.co/license/#sfxFree", "",
+           "Processing: leading-silence trim, per-category duration limit, -1 dBFS peak, 40 ms fade-out.", ""]
+    for cat, (max_d, mode, items) in CATEGORIES.items():
         d = os.path.join(BANK, cat)
         os.makedirs(d, exist_ok=True)
         lic.append(f"[{cat}]")
@@ -114,5 +115,5 @@ if __name__ == "__main__":
             lic.append(f"  {fn:32s} {len(x) / SR:4.2f}s  '{name}'  {url}")
             print(cat, fn, f"{len(x) / SR:.2f}s")
         lic.append("")
-    with open(os.path.join(OUT, "LICENCAS.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(OUT, "LICENSES.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(lic) + "\n")

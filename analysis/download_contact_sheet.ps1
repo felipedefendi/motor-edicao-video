@@ -1,7 +1,8 @@
 param([string]$ListFile, [string]$OutDir)
-# Baixa cada URL e gera folha de contato: 1 linha por video, 6 frames espalhados, rotulo com indice/@/duracao
+# Downloads each URL in the list and builds a contact sheet: one row per video, 6 spread-out frames,
+# label with index, author handle and duration. Requires yt-dlp, ffmpeg and ffprobe on the PATH.
 New-Item -ItemType Directory -Force $OutDir | Out-Null
-$fix = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+$color = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
 $rows = @(); $i = 0
 foreach ($url in Get-Content $ListFile) {
     if (-not $url.Trim()) { continue }
@@ -10,13 +11,13 @@ foreach ($url in Get-Content $ListFile) {
     $user = ($url -split '/@')[1].Split('/')[0]
     $mp4 = Join-Path $OutDir "$id.mp4"
     if (-not (Test-Path $mp4)) { yt-dlp -q -S "res:720" -o $mp4 $url 2>$null }
-    if (-not (Test-Path $mp4)) { "[$i] FALHOU @$user"; continue }
+    if (-not (Test-Path $mp4)) { "[$i] FAILED @$user"; continue }
     $dur = [double](ffprobe -v error -show_entries format=duration -of csv=p=0 $mp4)
     $tiles = @()
     foreach ($p in 0.05, 0.22, 0.4, 0.58, 0.76, 0.93) {
         $t = [math]::Round($dur * $p, 1)
         $f = Join-Path $OutDir "$id-$p.jpg"
-        ffmpeg -v error -y -ss $t -i $mp4 -frames:v 1 -vf "$fix,scale=-2:260,pad=148:260:(ow-iw)/2:0,drawtext=text='$t':fontcolor=yellow:fontsize=14:x=3:y=244:fontfile='C\:/Windows/Fonts/arial.ttf'" $f 2>$null
+        ffmpeg -v error -y -ss $t -i $mp4 -frames:v 1 -vf "$color,scale=-2:260,pad=148:260:(ow-iw)/2:0,drawtext=text='$t':fontcolor=yellow:fontsize=14:x=3:y=244:fontfile='C\:/Windows/Fonts/arial.ttf'" $f 2>$null
         if (Test-Path $f) { $tiles += $f }
     }
     if ($tiles.Count -eq 0) { continue }
@@ -27,5 +28,5 @@ foreach ($url in Get-Content $ListFile) {
     "[$i] @$user $id $([math]::Round($dur))s"
 }
 $in = $rows | ForEach-Object { '-i'; $_ }
-$out = Join-Path $OutDir "folha.jpg"
+$out = Join-Path $OutDir "sheet.jpg"
 if ($rows.Count -gt 1) { ffmpeg -v error -y @in -filter_complex "vstack=inputs=$($rows.Count)" $out 2>$null } elseif ($rows.Count -eq 1) { Copy-Item $rows[0] $out }
